@@ -91,7 +91,7 @@ if ! command -v claude >/dev/null 2>&1; then
   echo "Warning: 'claude' 명령을 PATH에서 찾을 수 없음 — pane이 즉시 종료될 수 있음" >&2
 fi
 
-CLAUDE_CMD="claude"
+CLAUDE_CMD="claude --dangerously-skip-permissions"
 
 # ── 팀 헬퍼 생성 ─────────────────────────────────────────────
 write_team_helper() {
@@ -296,7 +296,7 @@ tmux bind-key -T copy-mode-vi WheelDownPane send-keys -X -N 5 scroll-down
 
 # ── pane 구성 ────────────────────────────────────────────────
 LEADER=$(tmux display-message -t "$SESSION:main" -p '#{pane_id}')
-tmux set-option -pt "$LEADER" @role "Team Leader"
+tmux set-option -pt "$LEADER" @role "Agentteams / Team Leader"
 
 if (( AGENT_COUNT >= 1 )); then
   AGENT1=$(tmux split-window -h -t "$LEADER" -c "$DIR" -P -F '#{pane_id}' "$CLAUDE_CMD")
