@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# claude-agent.sh — Claude Agent Team 통합 구성기
+# agent-tmux.sh — Claude Agent Team 통합 구성기
 #
 #   -mode agentteams  자율적 팀원 구성, 리더가 조율
 #   -mode subagent    전문화 서브에이전트, 리더가 위임 (기본)
@@ -205,6 +205,7 @@ MODE=$MODE
 MODE_LABEL=$MODE_LABEL
 MODEL_FLAG=$MODEL_FLAG
 MODEL_DISPLAY=$MODEL_DISPLAY
+TEAM_COUNT=$TEAM_COUNT
 CONFEOF
 
   # members (에이전트 이름 목록, scale/add/remove 로 동적 변경)
@@ -261,19 +262,33 @@ send_to_pane() {
   tmux send-keys -t "$1" Enter
 }
 
-# 에이전트 타이틀 문자열 생성
+# 에이전트 타이틀 문자열 생성 (왼쪽 정렬 표시)
 #   make_role_title IDX [TASK]
-#   [Subagent] Agent-1(Sonnet 4.6)
-#   [Subagent] Agent-1(Sonnet 4.6) : M0 구현
+#   Agent-1(Sonnet 4.6)
+#   Agent-1(Sonnet 4.6) - 시장조사
 make_role_title() {
   local idx="$1" task="${2:-}"
-  local base="$MODE_LABEL Agent-$idx($MODEL_DISPLAY)"
-  [[ -n "$task" ]] && echo "$base : $task" || echo "$base"
+  local base="Agent-$idx($MODEL_DISPLAY)"
+  if [[ -z "$task" ]]; then
+    echo "$base"
+  else
+    echo "$base - $task"
+  fi
 }
 
 set_pane_title() {
   local idx="$1" title="$2"
   tmux set-option -pt "$SESSION:0.$idx" @role "$title" 2>/dev/null || true
+}
+
+# 오른쪽 상태 표시: 대기/진행/완료 → "[대기]" 등으로 설정
+set_pane_status() {
+  local idx="$1" status="${2:-}"
+  if [[ -n "$status" ]]; then
+    tmux set-option -pt "$SESSION:0.$idx" @status "[$status]" 2>/dev/null || true
+  else
+    tmux set-option -pt "$SESSION:0.$idx" @status "" 2>/dev/null || true
+  fi
 }
 
 rebalance_heights() {
@@ -310,6 +325,7 @@ do_scale() {
       echo "$new_name" >> "$SCRIPT_DIR/members"
       load_members
       tmux set-option -pt "$new_id" @role "$(make_role_title "$new_idx")"
+      tmux set-option -pt "$new_id" @status "[대기]"
       last_idx="$new_idx"
       echo "  ✓ Agent-$new_idx ($new_name) 추가됨 — claude 실행 중"
     done
@@ -351,6 +367,7 @@ cmd_send() {
   local msg="$*"
   [[ -n "$msg" ]] || { echo "Error: message 필요" >&2; exit 1; }
   local idx; idx=$(resolve "$target")
+  set_pane_status "$idx" "진행"
   send_to_pane "$SESSION:0.$idx" "$msg"
   echo "→ [$(make_role_title "$idx")]: $msg"
 }
@@ -360,6 +377,7 @@ cmd_broadcast() {
   local msg="$*"
   [[ -n "$msg" ]] || { echo "Error: message 필요" >&2; exit 1; }
   for (( i=1; i<=AGENT_COUNT; i++ )); do
+    set_pane_status "$i" "진행"
     send_to_pane "$SESSION:0.$i" "$msg"
   done
   echo "→ 전체 $AGENT_COUNT 팀: $msg"
@@ -400,7 +418,7 @@ cmd_status() {
   done
 }
 
-# assign: 업무 타이틀 설정 + 메시지 전송 (pane 타이틀에 실시간 반영)
+# assign: 업무 타이틀 설정 + 상태 [진행] + 메시지 전송
 cmd_assign() {
   check_session; load_members
   local target="${1:?'assign <NAME|N> <TITLE> [MESSAGE] 필요'}"; shift
@@ -409,14 +427,33 @@ cmd_assign() {
   local idx; idx=$(resolve "$target")
   local new_title; new_title="$(make_role_title "$idx" "$task_title")"
   set_pane_title "$idx" "$new_title"
-  echo "  타이틀 → $new_title"
+  set_pane_status "$idx" "진행"
+  echo "  타이틀 → $new_title   [진행]"
   if [[ -n "$msg" ]]; then
     send_to_pane "$SESSION:0.$idx" "$msg"
     echo "  메시지 → $msg"
   fi
 }
 
-# title: 타이틀만 변경
+# done: 상태만 [완료]로 변경 (타이틀의 담당업무는 유지)
+cmd_done() {
+  check_session; load_members
+  local target="${1:?'done <NAME|N> 필요'}"
+  local idx; idx=$(resolve "$target")
+  set_pane_status "$idx" "완료"
+  echo "  상태 → [완료]"
+}
+
+# wait: 상태를 [대기]로 초기화
+cmd_wait() {
+  check_session; load_members
+  local target="${1:?'wait <NAME|N> 필요'}"
+  local idx; idx=$(resolve "$target")
+  set_pane_status "$idx" "대기"
+  echo "  상태 → [대기]"
+}
+
+# title: 타이틀만 변경 (상태는 유지)
 cmd_title() {
   check_session; load_members
   local target="${1:?'title <NAME|N> <TITLE> 필요'}"; shift
@@ -468,8 +505,10 @@ Commands:
   view <NAME|N> [lines]             pane 출력 (기본 40줄)
   leader <message>                  리더에게 메시지
   status                            상태 + 타이틀 전체 조회
-  assign <NAME|N> <TITLE> [MSG]     업무 타이틀 설정 + 메시지 전송
-  title <NAME|N> <TITLE>            타이틀만 변경
+  assign <NAME|N> <TITLE> [MSG]     업무 배정 + [진행] 상태 설정
+  done <NAME|N>                     상태 → [완료]
+  wait <NAME|N>                     상태 → [대기]
+  title <NAME|N> <TITLE>            타이틀만 변경 (상태 유지)
   scale <N>                         에이전트를 N명으로 변경 (pane 자동 추가/제거)
   add [NAME]                        에이전트 1명 추가
   remove                            마지막 에이전트 제거
@@ -477,6 +516,8 @@ Commands:
 Examples:
   $(basename "$0") assign 1 "시장조사" "경쟁사 3개사 분석 시작해줘"
   $(basename "$0") assign interface "M0 구현" "proto 파일 작성해줘"
+  $(basename "$0") done 1
+  $(basename "$0") done interface
   $(basename "$0") title 2 "DB 설계"
   $(basename "$0") scale 5
   $(basename "$0") add backend
@@ -495,6 +536,8 @@ case "$SUBCMD" in
   leader)    cmd_leader    "$@" ;;
   status)    cmd_status    ;;
   assign)    cmd_assign    "$@" ;;
+  done)      cmd_done      "$@" ;;
+  wait)      cmd_wait      "$@" ;;
   title)     cmd_title     "$@" ;;
   scale)     cmd_scale     "$@" ;;
   add)       cmd_add       "$@" ;;
@@ -553,7 +596,42 @@ if [[ -n "${TMUX:-}" ]]; then
     exit 1
   }
 fi
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# 기존 세션 존재 시 설정 비교 — 동일하면 재사용, 변경되면 재생성
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  SAVED_CONFIG="$DIR/.claude-agent/config"
+  SAVED_MODE=""
+  SAVED_TEAM_COUNT=""
+  if [[ -f "$SAVED_CONFIG" ]]; then
+    SAVED_MODE=$(grep '^MODE=' "$SAVED_CONFIG" | cut -d= -f2- || echo "")
+    SAVED_TEAM_COUNT=$(grep '^TEAM_COUNT=' "$SAVED_CONFIG" | cut -d= -f2- || echo "")
+  fi
+
+  if [[ "$SAVED_MODE" == "$MODE" && "$SAVED_TEAM_COUNT" == "$TEAM_COUNT" ]]; then
+    # 동일 설정 — 재사용
+    echo "✓ 기존 세션 재사용: '$SESSION' (모드: $MODE, 에이전트: $TEAM_COUNT 명)" >&2
+    if (( NO_ATTACH )); then
+      cat <<HINT >&2
+✓ 세션 '$SESSION' 생성 완료 (attach 생략)
+  tmux attach -t $SESSION
+  tmux switch-client -t $SESSION
+HINT
+    elif [[ -n "${TMUX:-}" ]]; then
+      tmux switch-client -t "$SESSION"
+    elif [[ -t 1 ]]; then
+      tmux attach-session -t "$SESSION"
+    else
+      tmux switch-client -t "$SESSION" 2>/dev/null || true
+    fi
+    exit 0
+  else
+    # 설정 변경 — 재생성
+    echo "✓ 설정 변경 감지 (모드: ${SAVED_MODE:-?}→$MODE, 에이전트: ${SAVED_TEAM_COUNT:-?}→$TEAM_COUNT 명) — 세션 재생성" >&2
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+  fi
+else
+  true
+fi
 
 tmux new-session -d -s "$SESSION" -n main -c "$DIR" "$CLAUDE_CMD"
 tmux set-option -g history-limit 50000 >/dev/null 2>&1 || true
@@ -561,11 +639,28 @@ tmux set-option -g history-limit 50000 >/dev/null 2>&1 || true
 # ── 스타일링 ─────────────────────────────────────────────────
 tmux set-option -t "$SESSION" mouse on
 tmux set-option -t "$SESSION" pane-border-status top
-tmux set-option -t "$SESSION" pane-border-lines heavy
-tmux set-option -t "$SESSION" pane-border-style "fg=colour39"
-tmux set-option -t "$SESSION" pane-active-border-style "fg=colour39,bold"
+tmux set-option -t "$SESSION" pane-border-lines single
+tmux set-option -t "$SESSION" pane-border-style "fg=colour75"
+tmux set-option -t "$SESSION" pane-active-border-style "fg=colour75,bold"
 tmux set-option -t "$SESSION" pane-border-format \
-  '#{?pane_active,#[fg=colour15#,bg=colour27#,bold] ━━ #{@role} ━━ ,#[fg=colour39#,bg=default]  #{@role}  }'
+  '#{?pane_active,#[fg=colour255#,bg=colour75#,bold] #{@role} #[default]#[align=right]#{?#{@status}, #[fg=colour75#,bold] #{@status} #[default],},#[fg=colour75#,bold] #{@role}#[align=right]#{?#{@status}, #[fg=colour75] #{@status} ,}}'
+
+# 하단 status line
+tmux set-option -t "$SESSION" status on
+tmux set-option -t "$SESSION" status-position bottom
+tmux set-option -t "$SESSION" status-interval 5
+tmux set-option -t "$SESSION" status-style "bg=colour17,fg=colour75"
+# 왼쪽: 세션명 → 현재 폴더 → prefix 표시
+tmux set-option -t "$SESSION" status-left \
+  "#[fg=colour15,bg=colour75,bold] #S #[fg=colour75,bg=colour24,nobold]#[fg=colour15,bg=colour24] #{b:pane_current_path} #[fg=colour24,bg=colour17]#{?client_prefix,#[fg=colour196,bg=colour17,bold] ^B ,}"
+tmux set-option -t "$SESSION" status-left-length 60
+# 오른쪽: 에이전트 수 → 시간/날짜
+tmux set-option -t "$SESSION" status-right \
+  "#[fg=colour24,bg=colour17]#[fg=colour75,bg=colour24] #{window_panes} agents #[fg=colour75,bg=colour24]#[fg=colour15,bg=colour75,bold] %H:%M  %d-%b "
+tmux set-option -t "$SESSION" status-right-length 35
+tmux set-option -t "$SESSION" window-status-format ""
+tmux set-option -t "$SESSION" window-status-current-format ""
+tmux set-option -t "$SESSION" status-justify left
 
 tmux bind-key -T root WheelUpPane \
   if-shell -F -t = "#{pane_in_mode}" "send-keys -M" "copy-mode -eu"
@@ -577,6 +672,7 @@ tmux bind-key -T copy-mode-vi WheelDownPane send-keys -X -N 5 scroll-down
 # ── Pane 구성 ─────────────────────────────────────────────────
 LEADER=$(tmux display-message -t "$SESSION:main" -p '#{pane_id}')
 tmux set-option -pt "$LEADER" @role "$MODE_LABEL Team Leader($MODEL_DISPLAY)"
+tmux set-option -pt "$LEADER" @status ""
 
 PANE_IDS=()
 PREV="$LEADER"
@@ -587,8 +683,8 @@ for i in "${!TEAM_NAMES[@]}"; do
   else
     PANE_ID=$(tmux split-window -v -t "$PREV" -c "$DIR" -P -F '#{pane_id}' "$CLAUDE_CMD")
   fi
-  # 초기 타이틀: [Mode] Agent-N(Model)
-  tmux set-option -pt "$PANE_ID" @role "$MODE_LABEL Agent-$n($MODEL_DISPLAY)"
+  tmux set-option -pt "$PANE_ID" @role "Agent-$n($MODEL_DISPLAY)"
+  tmux set-option -pt "$PANE_ID" @status "[대기]"
   PANE_IDS+=("$PANE_ID")
   PREV="$PANE_ID"
 done
@@ -609,17 +705,16 @@ tmux select-pane -t "$LEADER"
 # ── 헬퍼 생성 ─────────────────────────────────────────────────
 write_agent_helper
 
-# ── 초기 프롬프트 주입 (에이전트에 명시적으로 지정된 경우에만) ──
-INJECT_NEEDED=0
-for prompt in "${TEAM_PROMPTS[@]}"; do [[ -n "$prompt" ]] && INJECT_NEEDED=1; done
+# ── 초기 프롬프트 주입 (모든 에이전트에게 보고 지침 + 태스크 프롬프트) ──
+(
+  sleep 4
+  for i in "${!TEAM_NAMES[@]}"; do
+    n=$(( i + 1 ))
+    pane_id="${PANE_IDS[$i]}"
 
-if (( INJECT_NEEDED )); then
-  (
-    sleep 4
-    for i in "${!TEAM_NAMES[@]}"; do
-      prompt="${TEAM_PROMPTS[$i]}"
-      [[ -z "$prompt" ]] && continue
-      pane_id="${PANE_IDS[$i]}"
+    # 태스크 프롬프트 (명시된 경우)
+    prompt="${TEAM_PROMPTS[$i]:-}"
+    if [[ -n "$prompt" ]]; then
       if [[ -f "$prompt" ]]; then
         prompt_text="$(cat "$prompt")"
       else
@@ -627,9 +722,15 @@ if (( INJECT_NEEDED )); then
       fi
       tmux send-keys -t "$pane_id" -l "$prompt_text"
       tmux send-keys -t "$pane_id" Enter
-    done
-  ) &
-fi
+      sleep 1
+    fi
+
+    # 완료 보고 지침 (항상 주입)
+    reporting_instruction="[팀 운영 규칙] 당신은 Agent-$n 입니다. 할당된 업무를 완료하면 반드시 다음 두 명령을 순서대로 실행하세요: 1) bash -c '$DIR/.claude-agent/team done $n'  2) bash -c \"$DIR/.claude-agent/team leader '[완료] Agent-$n: <완료 내용 한 줄 요약>'\""
+    tmux send-keys -t "$pane_id" -l "$reporting_instruction"
+    tmux send-keys -t "$pane_id" Enter
+  done
+) &
 
 # ── 완료 안내 ─────────────────────────────────────────────────
 cat <<BANNER >&2
@@ -655,6 +756,7 @@ done)
     ./.claude-agent/team status
 
 BANNER
+INJECT_NEEDED="${INJECT_NEEDED:-0}"
 if (( INJECT_NEEDED )); then
   echo "  초기 프롬프트: 4초 후 각 Agent pane에 자동 주입" >&2
   echo "" >&2
