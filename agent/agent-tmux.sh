@@ -21,6 +21,7 @@ set -euo pipefail
 
 MODE="subagent"
 SESSION=""
+SESSION_EXPLICIT=0   # -session 으로 명시 지정 시 1
 DIR="$PWD"
 NO_ATTACH=0
 TEAM_NAMES=()
@@ -37,7 +38,7 @@ Options:
   -mode agentteams|subagent   팀 모드 (기본: subagent)
   -model MODEL                사용 모델 (sonnet/opus/haiku 또는 full ID)
                               미지정 시 ~/.claude/settings.json 자동 감지
-  -agent N                    총 팀 인원 (리더 1 + Agent N-1), N: 2..11
+  -agent N                    전체 에이전트 수 (리더 포함), N: 2..10
   -team NAME [PROMPT]         이름 기반 팀 등록, 여러 번 사용 가능
                               PROMPT: 파일경로 or "인라인텍스트" (선택)
   -dir PATH                   작업 디렉토리 (기본: 현재)
@@ -50,7 +51,7 @@ Modes:
   subagent    이름 기반 전문화 에이전트, 리더 위임
 
 Examples:
-  # AgentTeams: 번호 기반 4명
+  # AgentTeams: 번호 기반 총 4명 (리더 1 + Agent 3)
   $(basename "$0") -mode agentteams -agent 4
 
   # Subagent: 이름 기반 (자동 subagent 모드)
@@ -126,7 +127,7 @@ while [[ $# -gt 0 ]]; do
       fi
       ;;
     -dir)       DIR="${2:-}"; shift 2 ;;
-    -session)   SESSION="${2:-}"; shift 2 ;;
+    -session)   SESSION="${2:-}"; SESSION_EXPLICIT=1; shift 2 ;;
     -no-attach) NO_ATTACH=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *)          echo "알 수 없는 옵션: $1" >&2; usage; exit 1 ;;
@@ -139,11 +140,11 @@ done
 # -agent N → 번호 기반 팀 생성
 if [[ -n "$AGENT_SIZE" ]]; then
   [[ ${#TEAM_NAMES[@]} -gt 0 ]] && { echo "Error: -agent 와 -team 동시 사용 불가" >&2; exit 1; }
-  [[ "$AGENT_SIZE" =~ ^[0-9]+$ ]] && (( AGENT_SIZE >= 1 )) || {
-    echo "Error: -agent 최소값 1 (팀리더만)" >&2; exit 1
+  [[ "$AGENT_SIZE" =~ ^[0-9]+$ ]] && (( AGENT_SIZE >= 2 )) || {
+    echo "Error: -agent 최소값 2 (리더 포함 총 수)" >&2; exit 1
   }
-  (( AGENT_SIZE <= 11 )) || { echo "Error: -agent 최대값 11" >&2; exit 1; }
-  for (( i=1; i<=AGENT_SIZE-1; i++ )); do
+  (( AGENT_SIZE <= 10 )) || { echo "Error: -agent 최대값 10 (리더 포함 총 수)" >&2; exit 1; }
+  for (( i=1; i<AGENT_SIZE; i++ )); do
     TEAM_NAMES+=("agent-$i"); TEAM_PROMPTS+=("")
   done
 fi
@@ -418,7 +419,7 @@ cmd_status() {
   done
 }
 
-# assign: 업무 타이틀 설정 + 상태 [진행] + 메시지 전송
+# assign: 업무 타이틀 설정 + 상태 [진행] + 메시지 전송 + 보고 지침 주입
 cmd_assign() {
   check_session; load_members
   local target="${1:?'assign <NAME|N> <TITLE> [MESSAGE] 필요'}"; shift
@@ -432,6 +433,9 @@ cmd_assign() {
   if [[ -n "$msg" ]]; then
     send_to_pane "$SESSION:0.$idx" "$msg"
     echo "  메시지 → $msg"
+    sleep 1
+    local reporting="[팀 운영 규칙] 당신은 Agent-$idx 입니다. 할당된 업무를 완료하면 반드시 다음 두 명령을 순서대로 실행하세요: 1) bash -c '$DIR/.claude-agent/team done $idx'  2) bash -c \"$DIR/.claude-agent/team leader '[완료] Agent-$idx: <완료 내용 한 줄 요약>'\""
+    send_to_pane "$SESSION:0.$idx" "$reporting"
   fi
 }
 
@@ -597,40 +601,48 @@ if [[ -n "${TMUX:-}" ]]; then
   }
 fi
 
-# 기존 세션 존재 시 설정 비교 — 동일하면 재사용, 변경되면 재생성
+# 기존 세션 존재 시 처리
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  SAVED_CONFIG="$DIR/.claude-agent/config"
-  SAVED_MODE=""
-  SAVED_TEAM_COUNT=""
-  if [[ -f "$SAVED_CONFIG" ]]; then
-    SAVED_MODE=$(grep '^MODE=' "$SAVED_CONFIG" | cut -d= -f2- || echo "")
-    SAVED_TEAM_COUNT=$(grep '^TEAM_COUNT=' "$SAVED_CONFIG" | cut -d= -f2- || echo "")
-  fi
+  if (( SESSION_EXPLICIT )); then
+    # -session 으로 명시된 경우: 설정 비교 후 재사용 또는 재생성
+    SAVED_CONFIG="$DIR/.claude-agent/config"
+    SAVED_MODE=""
+    SAVED_TEAM_COUNT=""
+    if [[ -f "$SAVED_CONFIG" ]]; then
+      SAVED_MODE=$(grep '^MODE=' "$SAVED_CONFIG" | cut -d= -f2- || echo "")
+      SAVED_TEAM_COUNT=$(grep '^TEAM_COUNT=' "$SAVED_CONFIG" | cut -d= -f2- || echo "")
+    fi
 
-  if [[ "$SAVED_MODE" == "$MODE" && "$SAVED_TEAM_COUNT" == "$TEAM_COUNT" ]]; then
-    # 동일 설정 — 재사용
-    echo "✓ 기존 세션 재사용: '$SESSION' (모드: $MODE, 에이전트: $TEAM_COUNT 명)" >&2
-    if (( NO_ATTACH )); then
-      cat <<HINT >&2
+    if [[ "$SAVED_MODE" == "$MODE" && "$SAVED_TEAM_COUNT" == "$TEAM_COUNT" ]]; then
+      echo "✓ 기존 세션 재사용: '$SESSION' (모드: $MODE, 에이전트: $TEAM_COUNT 명)" >&2
+      if (( NO_ATTACH )); then
+        cat <<HINT >&2
 ✓ 세션 '$SESSION' 생성 완료 (attach 생략)
   tmux attach -t $SESSION
   tmux switch-client -t $SESSION
 HINT
-    elif [[ -n "${TMUX:-}" ]]; then
-      tmux switch-client -t "$SESSION"
-    elif [[ -t 1 ]]; then
-      tmux attach-session -t "$SESSION"
+      elif [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$SESSION"
+      elif [[ -t 1 ]]; then
+        tmux attach-session -t "$SESSION"
+      else
+        tmux switch-client -t "$SESSION" 2>/dev/null || true
+      fi
+      exit 0
     else
-      tmux switch-client -t "$SESSION" 2>/dev/null || true
+      echo "✓ 설정 변경 감지 (모드: ${SAVED_MODE:-?}→$MODE, 에이전트: ${SAVED_TEAM_COUNT:-?}→$TEAM_COUNT 명) — 세션 재생성" >&2
+      tmux kill-session -t "$SESSION" 2>/dev/null || true
     fi
-    exit 0
   else
-    # 설정 변경 — 재생성
-    echo "✓ 설정 변경 감지 (모드: ${SAVED_MODE:-?}→$MODE, 에이전트: ${SAVED_TEAM_COUNT:-?}→$TEAM_COUNT 명) — 세션 재생성" >&2
-    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    # 자동 생성된 이름인 경우: 충돌 시 숫자 suffix로 새 세션명 확보
+    BASE_SESSION="$SESSION"
+    COUNTER=2
+    while tmux has-session -t "$SESSION" 2>/dev/null; do
+      SESSION="${BASE_SESSION}-${COUNTER}"
+      (( COUNTER++ ))
+    done
+    echo "ℹ 세션 '$BASE_SESSION' 이미 존재 — 새 세션 '$SESSION' 생성" >&2
   fi
-else
-  true
 fi
 
 tmux new-session -d -s "$SESSION" -n main -c "$DIR" "$CLAUDE_CMD"
@@ -705,27 +717,24 @@ tmux select-pane -t "$LEADER"
 # ── 헬퍼 생성 ─────────────────────────────────────────────────
 write_agent_helper
 
-# ── 초기 프롬프트 주입 (모든 에이전트에게 보고 지침 + 태스크 프롬프트) ──
+# ── 초기 프롬프트 주입 (프롬프트 명시된 에이전트만) ──
 (
   sleep 4
   for i in "${!TEAM_NAMES[@]}"; do
     n=$(( i + 1 ))
     pane_id="${PANE_IDS[$i]}"
 
-    # 태스크 프롬프트 (명시된 경우)
     prompt="${TEAM_PROMPTS[$i]:-}"
-    if [[ -n "$prompt" ]]; then
-      if [[ -f "$prompt" ]]; then
-        prompt_text="$(cat "$prompt")"
-      else
-        prompt_text="$prompt"
-      fi
-      tmux send-keys -t "$pane_id" -l "$prompt_text"
-      tmux send-keys -t "$pane_id" Enter
-      sleep 1
-    fi
+    [[ -z "$prompt" ]] && continue   # 프롬프트 없으면 아무것도 보내지 않음
 
-    # 완료 보고 지침 (항상 주입)
+    if [[ -f "$prompt" ]]; then
+      prompt_text="$(cat "$prompt")"
+    else
+      prompt_text="$prompt"
+    fi
+    tmux send-keys -t "$pane_id" -l "$prompt_text"
+    tmux send-keys -t "$pane_id" Enter
+    sleep 1
     reporting_instruction="[팀 운영 규칙] 당신은 Agent-$n 입니다. 할당된 업무를 완료하면 반드시 다음 두 명령을 순서대로 실행하세요: 1) bash -c '$DIR/.claude-agent/team done $n'  2) bash -c \"$DIR/.claude-agent/team leader '[완료] Agent-$n: <완료 내용 한 줄 요약>'\""
     tmux send-keys -t "$pane_id" -l "$reporting_instruction"
     tmux send-keys -t "$pane_id" Enter
@@ -756,9 +765,10 @@ done)
     ./.claude-agent/team status
 
 BANNER
-INJECT_NEEDED="${INJECT_NEEDED:-0}"
+INJECT_NEEDED=0
+for _p in "${TEAM_PROMPTS[@]}"; do [[ -n "$_p" ]] && { INJECT_NEEDED=1; break; }; done
 if (( INJECT_NEEDED )); then
-  echo "  초기 프롬프트: 4초 후 각 Agent pane에 자동 주입" >&2
+  echo "  초기 프롬프트: 4초 후 해당 Agent pane에 자동 주입" >&2
   echo "" >&2
 fi
 
